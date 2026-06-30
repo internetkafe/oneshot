@@ -1,6 +1,5 @@
 # OneShot‑pin (форк internetkafe)
 
-https://t.me/inetkafe
 
 
 Оригинал: [rofl0r/OneShot](https://github.com/rofl0r/OneShot)  
